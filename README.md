@@ -15,8 +15,9 @@ Used by [pico-serialport](https://github.com/padcom/pico-serialport) (port listi
 import { classDevices, usbDeviceOf } from "padcom/pico-linux-sysfs"
 
 for (const tty of await classDevices("tty")) {
-  if (tty.device == null) continue                 // a virtual terminal
-  const usb = await usbDeviceOf(tty.device)
+  const device = tty.device
+  if (device == null) continue                     // a virtual terminal
+  const usb = await usbDeviceOf(device)
   println(`/dev/${tty.name} ${usb?.vendorId ?? ""}:${usb?.productId ?? ""} ${usb?.product ?? ""}`)
 }
 ```
