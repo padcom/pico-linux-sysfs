@@ -1,0 +1,128 @@
+// Reading Linux's sysfs (/sys): attributes, the devices of a class, and the USB device a device sits
+// on. Plain Pico over std/fs (symlinks resolved here, not by libc), so it runs interpreted too; every
+// function takes the sysfs root, so tests can use a made-up tree. Nothing fails: what can't be read
+// is null (or empty), as on a system without sysfs or in a sandbox.
+import { readDir, readText, readlink, stat } from "std/fs"
+import { cwd } from "std/process"
+
+/// Where sysfs is mounted.
+export const SYSFS: string = "/sys"
+
+/// The text of the attribute file `path`, trimmed; null when it can't be read.
+export async function attribute(path: string): Promise<string?> {
+  try {
+    return (await readText(path)).trim()
+  } catch (e: Error) {
+    return null
+  }
+}
+
+/// The attribute at `path`, or `otherwise`.
+export async function attributeOr(path: string, otherwise: string): Promise<string> {
+  return (await attribute(path)) ?? otherwise
+}
+
+/// A hexadecimal attribute (`0403`, `0x1209`) as a number; null for anything else.
+export function parseHex(text: string): int? {
+  const s = if (text.startsWith("0x") || text.startsWith("0X")) text.slice(2) else text
+  if (s.length == 0) {
+    return null
+  }
+  return int.parse(s, 16)
+}
+
+/// `path` with every symbolic link resolved, `.` and `..` removed (relative paths from the current
+/// directory); null when a part of it doesn't exist (or links loop).
+export async function canonical(path: string): Promise<string?> {
+  const pending = (if (path.startsWith("/")) path else `${cwd()}/${path}`).split("/")
+  const done: string[] = []
+  let links = 0
+  while (pending.length > 0) {
+    const part = pending.shift() ?? ""
+    if (part == "" || part == ".") {
+      continue
+    }
+    if (part == "..") {
+      const _parent = done.pop()
+      continue
+    }
+    const here = `/${done.join("/")}${if (done.length > 0) "/" else ""}${part}`
+    try {
+      const info = await stat(here, false)
+      if (!info.isSymlink) {
+        done.push(part)
+        continue
+      }
+      links += 1
+      if (links > 40) {
+        return null
+      }
+      const target = await readlink(here)
+      if (target.startsWith("/")) {
+        done.splice(0, done.length)
+      }
+      pending.unshift(...target.split("/"))
+    } catch (e: Error) {
+      return null
+    }
+  }
+  return `/${done.join("/")}`
+}
+
+/// An entry of `<sysfs>/class/<class>`: `ttyUSB0` and the device directory behind it.
+export struct ClassDevice {
+  /// The entry's name (`ttyUSB0`, `event3`).
+  name: string
+  /// The entry: `<sysfs>/class/<class>/<name>`.
+  path: string
+  /// Its `device` link resolved: the device directory, null for a virtual one (`tty0`).
+  device: string?
+}
+
+/// The entries of `<sysfs>/class/<cls>` in name order (none without sysfs).
+export async function classDevices(cls: string, sysfs: string = SYSFS): Promise<ClassDevice[]> {
+  const out: ClassDevice[] = []
+  try {
+    for await (const e of readDir(`${sysfs}/class/${cls}`)) {
+      const path = `${sysfs}/class/${cls}/${e.name}`
+      out.push({ name: e.name, path, device: await canonical(`${path}/device`) })
+    }
+  } catch (e: Error) {
+    // No such class, or no sysfs.
+  }
+  out.sort((a: ClassDevice, b: ClassDevice) => a.name.localeCompare(b.name))
+  return out
+}
+
+/// A USB device, from its directory's attributes. The ids are as sysfs gives them (4 hex digits).
+export struct UsbDevice {
+  /// The device's directory (`…/usb1/1-1`).
+  path: string
+  vendorId: string
+  productId: string
+  serialNumber?: string
+  manufacturer?: string
+  product?: string
+}
+
+/// The USB device `device` (a device directory, as `ClassDevice.device`) is on: the nearest
+/// directory at or above it, but inside `sysfs`, that has an `idVendor`. Null when it isn't on USB.
+export async function usbDeviceOf(device: string, sysfs: string = SYSFS): Promise<UsbDevice?> {
+  const root = (await canonical(sysfs)) ?? sysfs
+  let d = device
+  while (d.length > root.length && d.startsWith(root)) {
+    const vendor = await attribute(`${d}/idVendor`)
+    if (vendor != null) {
+      return {
+        path: d,
+        vendorId: vendor,
+        productId: await attributeOr(`${d}/idProduct`, ""),
+        serialNumber: await attribute(`${d}/serial`),
+        manufacturer: await attribute(`${d}/manufacturer`),
+        product: await attribute(`${d}/product`),
+      }
+    }
+    d = d.slice(0, d.lastIndexOf("/"))
+  }
+  return null
+}

@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  PICO_VERSION: 0.9.0
+
+jobs:
+  ci:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # sysfs is Linux's: the other systems have nothing to read.
+        include:
+          - { target: linux-x64, runner: ubuntu-24.04 }
+          - { target: linux-arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned Pico
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$PICO_VERSION
+          gh release download "v$v" -R padcom/pico-lang -p "pico-$v-${{ matrix.target }}.tar.gz" -D "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/pico"
+          tar -xzf "$RUNNER_TEMP/pico-$v-${{ matrix.target }}.tar.gz" -C "$RUNNER_TEMP/pico"
+          dirname "$(find "$RUNNER_TEMP/pico" -type f -name pico -perm -u+x | head -1)" >> "$GITHUB_PATH"
+      - name: Format
+        run: |
+          pico --version
+          pico fmt --check .
+      - name: Lint
+        run: pico lint .
+      - name: Tests
+        run: |
+          pico test . | tee "$RUNNER_TEMP/test.log"
+          bash .github/tests-ran.sh "$RUNNER_TEMP/test.log"
+      - name: Tests (interpreted)
+        run: |
+          pico test --interp . | tee "$RUNNER_TEMP/test-interp.log"
+          bash .github/tests-ran.sh "$RUNNER_TEMP/test-interp.log"

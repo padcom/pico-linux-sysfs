@@ -1,0 +1,65 @@
+// The helpers over a made-up sysfs tree (symlinks as the kernel lays them out).
+import { describe, it, expect } from "std/test"
+import { exists, mkdir, remove, symlink, writeText } from "std/fs"
+import { pid } from "std/process"
+import { attribute, attributeOr, canonical, classDevices, parseHex, usbDeviceOf } from "./index"
+
+async function tree(): Promise<string> throws Error {
+  const root = `/tmp/pico-linux-sysfs-${pid}`
+  if (await exists(root)) {
+    await remove(root, true)
+  }
+  const usb = `${root}/devices/pci0000:00/usb1/1-1`
+  await mkdir(`${usb}/1-1:1.0/ttyUSB0/tty/ttyUSB0`, true)
+  await mkdir(`${root}/devices/platform/serial8250`, true)
+  for (const [name, value] of [["idVendor", "0403"], ["idProduct", "6001"], ["serial", "A10K1D2X"], ["manufacturer", "FTDI"]]) {
+    await writeText(`${usb}/${name}`, `${value}\n`)
+  }
+  await mkdir(`${root}/class/tty/tty0`, true)
+  await mkdir(`${root}/class/tty/ttyS0`, true)
+  // As the kernel does: class entries link to the device's directory, relatively.
+  await symlink("../../../devices/platform/serial8250", `${root}/class/tty/ttyS0/device`)
+  await symlink("../../devices/pci0000:00/usb1/1-1/1-1:1.0/ttyUSB0/tty/ttyUSB0", `${root}/class/tty/ttyUSB0`)
+  await symlink("../../../ttyUSB0", `${usb}/1-1:1.0/ttyUSB0/tty/ttyUSB0/device`)
+  return root
+}
+
+describe("sysfs", () => {
+  it("reads attributes", async () => {
+    const root = await tree()
+    expect(await attribute(`${root}/devices/pci0000:00/usb1/1-1/idVendor`)).toBe("0403")
+    expect(await attribute(`${root}/nope`) == null).toBe(true)
+    expect(await attributeOr(`${root}/nope`, "x")).toBe("x")
+    await remove(root, true)
+  })
+  it("parses hex ids", () => {
+    expect(parseHex("0403")).toBe(0x0403)
+    expect(parseHex("0x1209")).toBe(0x1209)
+    expect(parseHex("") == null).toBe(true)
+    expect(parseHex("xyz") == null).toBe(true)
+  })
+  it("resolves links, . and ..", async () => {
+    const root = await tree()
+    const real = await canonical(root)
+    expect(await canonical(`${root}/class/tty/ttyS0/device`)).toBe(`${real}/devices/platform/serial8250`)
+    expect(await canonical(`${root}/class/tty/./tty0/../ttyS0/device`)).toBe(`${real}/devices/platform/serial8250`)
+    expect(await canonical(`${root}/class/tty/missing`) == null).toBe(true)
+    await remove(root, true)
+  })
+  it("lists class devices and finds the USB device", async () => {
+    const root = await tree()
+    const real = (await canonical(root)) ?? root
+    const ttys = await classDevices("tty", root)
+    expect(ttys.map((t) => t.name).join(",")).toBe("tty0,ttyS0,ttyUSB0")
+    expect(ttys[0].device == null).toBe(true)
+    expect(await usbDeviceOf(ttys[1].device ?? "", root) == null).toBe(true)
+    const usb = await usbDeviceOf(ttys[2].device ?? "", root)
+    expect(usb != null).toBe(true)
+    if (usb != null) {
+      expect(`${usb.path} ${usb.vendorId}:${usb.productId} ${usb.serialNumber} ${usb.manufacturer} ${usb.product}`)
+        .toBe(`${real}/devices/pci0000:00/usb1/1-1 0403:6001 A10K1D2X FTDI null`)
+    }
+    expect((await classDevices("tty", "/nonexistent")).length).toBe(0)
+    await remove(root, true)
+  })
+})
